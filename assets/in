@@ -1,0 +1,113 @@
+#!/bin/bash
+# vim: set ft=sh
+
+set -e
+
+exec 3>&1 # make stdout available as fd 3 for the result
+exec 1>&2 # redirect all output to stderr for logging
+
+source $(dirname $0)/common.sh
+
+destination=$1
+
+if [ -z "$destination" ]; then
+  echo "usage: $0 <path/to/destination>" >&2
+  exit 1
+fi
+
+# for jq
+PATH=/usr/local/bin:$PATH
+
+payload=$(mktemp /tmp/resource-in.XXXXXX)
+
+cat > $payload <&0
+
+insecure_registries=$(jq -r '.source.insecure_registries // [] | join(" ")' < $payload)
+
+registry_mirror=$(jq -r '.source.registry_mirror // ""' < $payload)
+
+username=$(jq -r '.source.username // ""' < $payload)
+password=$(jq -r '.source.password // ""' < $payload)
+repository="$(jq -r '.source.repository // ""' < $payload)"
+tag="$(jq -r '.source.tag // "latest"' < $payload)"
+ca_certs=$(jq -r '.source.ca_certs // []' < $payload)
+client_certs=$(jq -r '.source.client_certs // []' < $payload)
+max_concurrent_downloads=$(jq -r '.source.max_concurrent_downloads // 3' < $payload)
+max_concurrent_uploads=$(jq -r '.source.max_concurrent_uploads // 3' < $payload)
+
+# crossent      
+api_url=$(jq -r '.source.api_url // ""' < $payload)
+if [ -n "$api_url" ]; then
+  oc login -u $username -p $password $api_url --insecure-skip-tls-verify=true
+  password=$(oc whoami -t )
+fi
+
+
+export AWS_ACCESS_KEY_ID=$(jq -r '.source.aws_access_key_id // ""' < $payload)
+export AWS_SECRET_ACCESS_KEY=$(jq -r '.source.aws_secret_access_key // ""' < $payload)
+export AWS_SESSION_TOKEN=$(jq -r '.source.aws_session_token // ""' < $payload)
+
+if private_registry "${repository}" ; then
+  registry="$(extract_registry "${repository}")"
+else
+  registry=
+fi
+
+digest="$(jq -r '.version.digest' < $payload)"
+
+rootfs="$(jq -r '.params.rootfs // false' < $payload)"
+skip_download="$(jq -r '.params.skip_download // false' < $payload)"
+save="$(jq -r '.params.save // false' < $payload)"
+
+mkdir -p $destination
+
+image_name="${repository}@${digest}"
+
+if [ "$skip_download" = "false" ]; then
+  certs_to_file "$ca_certs"
+  set_client_certs "$client_certs"
+  start_docker \
+    "${max_concurrent_downloads}" \
+    "${max_concurrent_uploads}" \
+    "$insecure_registries" \
+    "$registry_mirror"
+
+  log_in "$username" "$password" "$registry"
+
+  docker_pull "$image_name"
+
+  if [ "$save" = "true" ]; then
+    docker save -o ${destination}/image "$image_name"
+  fi
+
+  image_id="$(image_from_digest "$repository" "$digest")"
+
+  echo "$image_id" > ${destination}/image-id
+  docker inspect $image_id > ${destination}/docker_inspect.json
+
+  docker run \
+    --cidfile=/tmp/container.cid \
+    -v /opt/resource/print-metadata:/tmp/print-metadata \
+    --entrypoint /tmp/print-metadata  \
+    "$image_name" > ${destination}/metadata.json
+
+  mkdir -p ${destination}/rootfs/
+  docker export $(cat /tmp/container.cid) | tar --exclude="dev/*" -xf - -C ${destination}/rootfs/
+
+  if [ "$rootfs" = "true" ]; then
+    docker export $(cat /tmp/container.cid) > ${destination}/rootfs.tar
+  fi
+fi
+
+echo "$repository" > ${destination}/repository
+echo "$tag" > ${destination}/tag
+echo "$digest" > ${destination}/digest
+
+jq -n "{
+  version: {
+    digest: $(echo $digest | jq -R .)
+  },
+  metadata: [
+    { name: \"image\", value: $(echo $image_id | head -c 12 | jq -R .) }
+  ]
+}" >&3

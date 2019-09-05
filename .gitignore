@@ -1,0 +1,6 @@
+#assets/check
+#assets/print-metadata
+assets/oc
+tar-src/
+#*.test
+.idea
